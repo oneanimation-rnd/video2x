@@ -39,7 +39,7 @@ import time
 from enum import Enum
 from multiprocessing import Manager, Pool, Queue, Value
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import ffmpeg
 from cv2 import cv2
@@ -69,6 +69,7 @@ from .upscaler import Upscaler, UpscalerProcessor
 try:
     from pynput.keyboard import HotKey, Listener
 except ImportError:
+    Listener = None
     ENABLE_HOTKEY = False
 else:
     ENABLE_HOTKEY = True
@@ -219,7 +220,7 @@ class Video2X:
         decoder_thread: VideoDecoderThread,
         processes: int,
         processor_pool: Pool,
-        keyboard_listener: Any
+        keyboard_listener: Optional[Listener]
     ):
         if ENABLE_HOTKEY is True and keyboard_listener is not None:
             keyboard_listener.stop()
