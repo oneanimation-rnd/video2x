@@ -59,7 +59,7 @@ from rich.text import Text
 from video2x.processor import Processor
 
 from . import __version__
-from .decoder import VideoDecoder, VideoDecoderThread
+from .decoder import VideoDecoder, VideoDecoderThread, ImageProcessorThread
 from .encoder import VideoEncoder
 from .interpolator import Interpolator, InterpolatorProcessor
 from .upscaler import Upscaler, UpscalerProcessor
@@ -109,6 +109,13 @@ class Video2X:
     def __init__(self) -> None:
         self.version = __version__
 
+        # create console for rich's Live display
+        self.console = Console()
+
+        # record original STDOUT and STDERR for restoration
+        self.original_stdout = sys.stdout
+        self.original_stderr = sys.stderr
+
     @staticmethod
     def _get_video_info(path: Path) -> tuple:
         """
@@ -138,7 +145,113 @@ class Video2X:
 
         return video_info["width"], video_info["height"], total_frames, frame_rate
 
-    def _run(
+    def _setup_progress_bar(self, mode, pause_flag, total_frames):
+
+        # create progress bar
+        progress = Progress(
+            "[progress.description]{task.description}",
+            BarColumn(complete_style="blue", finished_style="green"),
+            "[progress.percentage]{task.percentage:>3.0f}%",
+            "[color(240)]({task.completed}/{task.total})",
+            ProcessingSpeedColumn(),
+            TimeElapsedColumn(),
+            "<",
+            TimeRemainingColumn(),
+            console=self.console,
+            speed_estimate_period=300.0,
+            disable=True,
+        )
+        task = progress.add_task(f"[cyan]{mode.value['label']}", total=total_frames)
+
+        def _toggle_pause(_signal_number: int = -1, _frame=None):
+            # allow the closure to modify external immutable flag
+            nonlocal pause_flag
+
+            # print console messages and update the progress bar's status
+            if pause_flag.value is False:
+                progress.update(
+                    task, description=f"[cyan]{mode.value['label']} (paused)"
+                )
+                progress.stop_task(task)
+                logger.warning("Processing paused, press Ctrl+Alt+V again to resume")
+
+            # the lock is already acquired
+            elif pause_flag.value is True:
+                progress.update(task, description=f"[cyan]{mode.value['label']}")
+                logger.warning("Resuming processing")
+                progress.start_task(task)
+
+            # invert the flag
+            with pause_flag.get_lock():
+                pause_flag.value = not pause_flag.value
+
+        # allow sending SIGUSR1 to pause/resume processing
+        signal.signal(signal.SIGUSR1, _toggle_pause)
+
+        keyboard_listener = None
+
+        # enable global pause hotkey if it's supported
+        if ENABLE_HOTKEY is True:
+            # create global pause hotkey
+            pause_hotkey = HotKey(HotKey.parse("<ctrl>+<alt>+v"), _toggle_pause)
+
+            # create global keyboard input listener
+            keyboard_listener = Listener(
+                on_press=(
+                    lambda key: pause_hotkey.press(keyboard_listener.canonical(key))
+                ),
+                on_release=(
+                    lambda key: pause_hotkey.release(keyboard_listener.canonical(key))
+                ),
+            )
+
+            # start monitoring global key presses
+            keyboard_listener.start()
+
+        return progress, task, keyboard_listener
+
+    def _handle_exceptions(
+        self,
+        tasks_queue: Queue,
+        exceptions: list,
+        decoder: VideoDecoder,
+        encoder: VideoEncoder,
+        decoder_thread: VideoDecoderThread,
+        processes: int,
+        processor_pool: Pool,
+        keyboard_listener: Any
+    ):
+        if ENABLE_HOTKEY is True and keyboard_listener is not None:
+            keyboard_listener.stop()
+            keyboard_listener.join()
+
+        if len(exceptions) > 0:
+            if decoder is not None:
+                decoder.kill()
+            if encoder is not None:
+                encoder.kill()
+
+        decoder_thread.stop()
+        decoder_thread.join()
+
+        while not tasks_queue.empty():
+            tasks_queue.get()
+        for _ in range(processes):
+            tasks_queue.put(None)
+
+        processor_pool.close()
+        processor_pool.join()
+
+        sys.stdout = self.original_stdout
+        sys.stderr = self.original_stderr
+
+        logger.remove()
+        logger.add(sys.stderr, colorize=True, format=LOGURU_FORMAT)
+
+        if len(exceptions) > 0:
+            raise exceptions[0]
+
+    def _run_video_processing(
         self,
         input_path: Path,
         width: int,
@@ -181,16 +294,9 @@ class Video2X:
                 )
                 return
 
-        # record original STDOUT and STDERR for restoration
-        original_stdout = sys.stdout
-        original_stderr = sys.stderr
-
-        # create console for rich's Live display
-        console = Console()
-
         # redirect STDOUT and STDERR to console
-        sys.stdout = FileProxy(console, sys.stdout)
-        sys.stderr = FileProxy(console, sys.stderr)
+        sys.stdout = FileProxy(self.console, sys.stdout)
+        sys.stderr = FileProxy(self.console, sys.stderr)
 
         # re-add Loguru to point to the new STDERR
         logger.remove()
@@ -200,6 +306,11 @@ class Video2X:
         tasks_queue = Queue(maxsize=processes * 10)
         processed_frames = Manager().dict()
         pause_flag = Value(ctypes.c_bool, False)
+
+        # setup progress bar
+        progress, task, keyboard_listener = self._setup_progress_bar(
+            mode, pause_flag, total_frames
+        )
 
         # set up and start decoder thread
         logger.info("Starting video decoder")
@@ -226,66 +337,7 @@ class Video2X:
         processor: Processor = mode.value["processor"](
             tasks_queue, processed_frames, pause_flag
         )
-        processor_pool = Pool(processes, processor.process)
-
-        # create progress bar
-        progress = Progress(
-            "[progress.description]{task.description}",
-            BarColumn(complete_style="blue", finished_style="green"),
-            "[progress.percentage]{task.percentage:>3.0f}%",
-            "[color(240)]({task.completed}/{task.total})",
-            ProcessingSpeedColumn(),
-            TimeElapsedColumn(),
-            "<",
-            TimeRemainingColumn(),
-            console=console,
-            speed_estimate_period=300.0,
-            disable=True,
-        )
-        task = progress.add_task(f"[cyan]{mode.value['label']}", total=total_frames)
-
-        def _toggle_pause(_signal_number: int = -1, _frame=None):
-            # allow the closure to modify external immutable flag
-            nonlocal pause_flag
-
-            # print console messages and update the progress bar's status
-            if pause_flag.value is False:
-                progress.update(
-                    task, description=f"[cyan]{mode.value['label']} (paused)"
-                )
-                progress.stop_task(task)
-                logger.warning("Processing paused, press Ctrl+Alt+V again to resume")
-
-            # the lock is already acquired
-            elif pause_flag.value is True:
-                progress.update(task, description=f"[cyan]{mode.value['label']}")
-                logger.warning("Resuming processing")
-                progress.start_task(task)
-
-            # invert the flag
-            with pause_flag.get_lock():
-                pause_flag.value = not pause_flag.value
-
-        # allow sending SIGUSR1 to pause/resume processing
-        signal.signal(signal.SIGUSR1, _toggle_pause)
-
-        # enable global pause hotkey if it's supported
-        if ENABLE_HOTKEY is True:
-            # create global pause hotkey
-            pause_hotkey = HotKey(HotKey.parse("<ctrl>+<alt>+v"), _toggle_pause)
-
-            # create global keyboard input listener
-            keyboard_listener = Listener(
-                on_press=(
-                    lambda key: pause_hotkey.press(keyboard_listener.canonical(key))
-                ),
-                on_release=(
-                    lambda key: pause_hotkey.release(keyboard_listener.canonical(key))
-                ),
-            )
-
-            # start monitoring global key presses
-            keyboard_listener.start()
+        processor_pool = Pool(processes, processor.process_video)
 
         # a temporary variable that stores the exception
         exceptions = []
@@ -334,45 +386,119 @@ class Video2X:
             logger.info("Writing video trailer")
 
         finally:
-            # stop keyboard listener
-            if ENABLE_HOTKEY is True:
-                keyboard_listener.stop()
-                keyboard_listener.join()
+            self._handle_exceptions(
+                tasks_queue,
+                exceptions,
+                decoder,
+                encoder,
+                decoder_thread,
+                processes,
+                processor_pool,
+                keyboard_listener)
 
-            # if errors have occurred, kill the FFmpeg processes
-            if len(exceptions) > 0:
-                decoder.kill()
-                encoder.kill()
+    def _run_image_processing(
+        self,
+        input_path: Path,
+        output_path: Path,
+        mode: ProcessingMode,
+        processes: int,
+        processing_settings: tuple,
+    ) -> None:
 
-            # stop the decoder
-            decoder_thread.stop()
-            decoder_thread.join()
+        # Create the output directory if it doesn't exist
+        output_path.mkdir(parents=True, exist_ok=True)
 
-            # clear queue and signal processors to exit
-            # multiprocessing.Queue has no Queue.queue.clear
-            while tasks_queue.empty() is not True:
-                tasks_queue.get()
-            for _ in range(processes):
-                tasks_queue.put(None)
+        # List all image files in the input directory and sort them numerically
+        input_image_files = sorted(input_path.glob("*.png"))
 
-            # close and join the process pool
-            processor_pool.close()
-            processor_pool.join()
+        total_frames = len(input_image_files)
 
-            # stop the encoder
-            encoder.join()
+        # redirect STDOUT and STDERR to console
+        sys.stdout = FileProxy(self.console, sys.stdout)
+        sys.stderr = FileProxy(self.console, sys.stderr)
 
-            # restore original STDOUT and STDERR
-            sys.stdout = original_stdout
-            sys.stderr = original_stderr
+        # re-add Loguru to point to the new STDERR
+        logger.remove()
+        logger.add(sys.stderr, colorize=True, format=LOGURU_FORMAT)
 
-            # re-add Loguru to point to the restored STDERR
-            logger.remove()
-            logger.add(sys.stderr, colorize=True, format=LOGURU_FORMAT)
+        tasks_queue = Queue(maxsize=processes * 10)
+        processed_frames = Manager().dict()
+        pause_flag = Value(ctypes.c_bool, False)
 
-            # raise the first collected error
-            if len(exceptions) > 0:
-                raise exceptions[0]
+        # setup progress bar
+        progress, task, keyboard_listener = self._setup_progress_bar(
+            mode, pause_flag, total_frames
+        )
+
+        # set up and start image processing threads
+        logger.info("Starting image processing threads")
+        process_thread = ImageProcessorThread(
+            tasks_queue, input_image_files, output_path, processing_settings)
+        process_thread.start()
+
+        # create a pool of processor processes to process the queue
+        processor: Processor = mode.value["processor"](
+            tasks_queue, processed_frames, pause_flag
+        )
+        processor_pool = Pool(processes, processor.process_image)
+
+        exceptions = []
+
+        try:
+            # Let the context manager automatically stop the progress bar
+            with progress:
+
+                frame_index = 0
+                while frame_index < total_frames:
+
+                    current_frame = processed_frames.get(frame_index)
+
+                    if pause_flag.value is True or current_frame is None:
+                        time.sleep(0.1)
+                        continue
+
+                    # show the progress bar after the processing starts
+                    # reduces speed estimation inaccuracies and print overlaps
+                    if frame_index == 0:
+                        progress.disable = False
+                        progress.start()
+
+                    if current_frame[0] is True:
+                        image, image_path = processed_frames.get(frame_index - 1)
+                        image.save(image_path)
+                        image.close()
+                    else:
+                        image, image_path = current_frame
+                        image.save(image_path)
+                        image.close()
+
+                        if frame_index > 0:
+                            del processed_frames[frame_index - 1]
+
+                    progress.update(task, completed=frame_index + 1)
+                    frame_index += 1
+
+        except (SystemExit, KeyboardInterrupt) as error:
+            logger.warning("Exit signal received, exiting gracefully")
+            logger.warning("Press ^C again to force terminate")
+
+        except Exception as error:
+            logger.exception(error)
+
+        else:
+            logger.info("Processing has completed")
+
+        finally:
+            self._handle_exceptions(
+                tasks_queue,
+                exceptions,
+                None,
+                None,
+                process_thread,
+                processes,
+                processor_pool,
+                keyboard_listener
+            )
 
     def upscale(
         self,
@@ -385,40 +511,58 @@ class Video2X:
         threshold: float,
         algorithm: str,
     ) -> None:
-        # get basic video information
-        width, height, total_frames, frame_rate = self._get_video_info(input_path)
 
-        # automatically calculate output width and height if only one is given
-        if output_width == 0 or output_width is None:
-            output_width = output_height / height * width
+        if input_path.is_file():
+            # get basic video information
+            width, height, total_frames, frame_rate = self._get_video_info(input_path)
 
-        elif output_height == 0 or output_height is None:
-            output_height = output_width / width * height
+            # automatically calculate output width and height if only one is given
+            if output_width == 0 or output_width is None:
+                output_width = output_height / height * width
 
-        # sanitize output width and height to be divisible by 2
-        output_width = int(math.ceil(output_width / 2.0) * 2)
-        output_height = int(math.ceil(output_height / 2.0) * 2)
+            elif output_height == 0 or output_height is None:
+                output_height = output_width / width * height
 
-        # start processing
-        self._run(
-            input_path,
-            width,
-            height,
-            total_frames,
-            frame_rate,
-            output_path,
-            output_width,
-            output_height,
-            ProcessingMode.UPSCALE,
-            processes,
-            (
+            # sanitize output width and height to be divisible by 2
+            output_width = int(math.ceil(output_width / 2.0) * 2)
+            output_height = int(math.ceil(output_height / 2.0) * 2)
+
+            # start processing
+            self._run_video_processing(
+                input_path,
+                width,
+                height,
+                total_frames,
+                frame_rate,
+                output_path,
                 output_width,
                 output_height,
-                algorithm,
-                noise,
-                threshold,
-            ),
-        )
+                ProcessingMode.UPSCALE,
+                processes,
+                (
+                    output_width,
+                    output_height,
+                    algorithm,
+                    noise,
+                    threshold,
+                ),
+            )
+
+        elif input_path.is_dir():
+            # start processing
+            self._run_image_processing(
+                input_path,
+                output_path,
+                ProcessingMode.UPSCALE,
+                processes,
+                (
+                    output_width,
+                    output_height,
+                    algorithm,
+                    noise,
+                    threshold,
+                ),
+            )
 
     def interpolate(
         self,
@@ -428,23 +572,24 @@ class Video2X:
         threshold: float,
         algorithm: str,
     ) -> None:
-        # get video basic information
-        width, height, original_frames, frame_rate = self._get_video_info(input_path)
+        if input_path.is_file():
+            # get video basic information
+            width, height, original_frames, frame_rate = self._get_video_info(input_path)
 
-        # calculate the number of total output frames
-        total_frames = original_frames * 2 - 1
+            # calculate the number of total output frames
+            total_frames = original_frames * 2 - 1
 
-        # start processing
-        self._run(
-            input_path,
-            width,
-            height,
-            total_frames,
-            frame_rate,
-            output_path,
-            width,
-            height,
-            ProcessingMode.INTERPOLATE,
-            processes,
-            (threshold, algorithm),
-        )
+            # start processing
+            self._run_video_processing(
+                input_path,
+                width,
+                height,
+                total_frames,
+                frame_rate,
+                output_path,
+                width,
+                height,
+                ProcessingMode.INTERPOLATE,
+                processes,
+                (threshold, algorithm),
+            )

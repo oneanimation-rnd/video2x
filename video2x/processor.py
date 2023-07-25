@@ -37,7 +37,11 @@ class Processor(ABC):
         self.pause_flag = pause_flag
 
     @abstractmethod
-    def process(self):
+    def process_video(self):
+        raise NotImplementedError
+
+    @abstractmethod
+    def process_image(self):
         raise NotImplementedError
 
     @staticmethod

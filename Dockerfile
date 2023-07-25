@@ -16,7 +16,7 @@ RUN apt-get update \
         python3.8 python3-pip python3-opencv python3-pil \
         python3.8-dev libvulkan-dev glslang-dev glslang-tools \
         build-essential swig \
-    && pip wheel -w /wheels wheel pdm-pep517 .
+    && pip wheel -w /wheels wheel pdm-backend .
 
 # stage 2: install wheels into the final image
 FROM docker.io/nvidia/vulkan:1.3-470

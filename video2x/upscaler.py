@@ -162,7 +162,7 @@ class Upscaler:
 
 
 class UpscalerProcessor(Processor, Upscaler):
-    def process(self) -> None:
+    def process_video(self) -> None:
         task = self.tasks_queue.get()
         while task is not None:
             try:
@@ -196,6 +196,50 @@ class UpscalerProcessor(Processor, Upscaler):
                     self.processed_frames[frame_index] = self.upscale_image(
                         current_frame, output_width, output_height, algorithm, noise
                     )
+
+                task = self.tasks_queue.get()
+
+            except KeyboardInterrupt:
+                break
+
+    def process_image(self) -> None:
+        task = self.tasks_queue.get()
+        while task is not None:
+
+            try:
+
+                if self.pause_flag.value is True:
+                    time.sleep(0.1)
+                    continue
+
+                # unpack the task's values
+                (
+                    frame_index,
+                    previous_frame,
+                    current_frame,
+                    output_path,
+                    (output_width, output_height, algorithm, noise, threshold),
+                ) = task
+
+                # calculate the %diff between the current frame and the previous frame
+                difference_ratio = 0
+                if previous_frame is not None:
+                    difference_ratio = self.get_image_diff(
+                        previous_frame, current_frame
+                    )
+
+                # if the difference is lower than threshold, skip this frame
+                if difference_ratio < threshold:
+
+                    # make the current image the same as the previous result
+                    self.processed_frames[frame_index] = (True, output_path)
+
+                # if the difference is greater than threshold
+                # process this frame
+                else:
+                    self.processed_frames[frame_index] = (self.upscale_image(
+                        current_frame, output_width, output_height, algorithm, noise
+                    ), output_path)
 
                 task = self.tasks_queue.get()
 

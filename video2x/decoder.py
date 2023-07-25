@@ -168,3 +168,42 @@ class VideoDecoderThread(Thread):
 
     def stop(self):
         self.running = False
+
+
+class ImageProcessorThread(Thread):
+    def __init__(
+        self, tasks_queue: Queue, input_image_files: list, output_path: pathlib.Path, processing_settings: tuple
+    ):
+        super().__init__()
+
+        self.input_image_files = input_image_files
+        self.output_path = output_path
+        self.tasks_queue = tasks_queue
+        self.processing_settings = processing_settings
+        self.running = False
+
+    def run(self):
+        self.running = True
+        previous_frame = None
+        for frame_index, image_path in enumerate(self.input_image_files):
+            frame = Image.open(image_path)
+
+            output_image_path = self.output_path / image_path.name
+
+            while True:
+
+                # check for the stop signal
+                if not self.running:
+                    return
+
+                with contextlib.suppress(Full):
+                    self.tasks_queue.put(
+                        (frame_index, previous_frame, frame, output_image_path, self.processing_settings),
+                        timeout=0.1,
+                    )
+                    break
+
+            previous_frame = frame
+
+    def stop(self):
+        self.running = False
